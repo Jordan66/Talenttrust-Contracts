@@ -35,8 +35,9 @@ Machine-readable details are in [deployments/testnet.json](deployments/testnet.j
 | `resign(id)` | freelancer | Resign from a `Created` or `Funded` escrow, refunding unreleased funds to the client and closing as `Cancelled`; records `Resigned(id)` |
 | `was_resigned(id) -> bool` | - | Returns true if the escrow was closed by freelancer resignation |
 | `issue_reputation(id, rating)` | client | Rate a completed or resolved job (1-5), once |
+| `void_rating(id, reason)` | admin | Void a fraudulent rating, reverse reputation and emit audit trail |
 | `set_paused(bool)` / `is_paused()` | admin / - | Circuit breaker for all mutations |
-| `get_contract(id)`, `contract_count()`, `get_reputation(addr)`, `get_outcomes(addr)`, `get_admin()`, `version()` | - | Reads |
+| `get_contract(id)`, `get_rating(id)`, `contract_count()`, `get_reputation(addr)`, `get_outcomes(addr)`, `get_admin()`, `version()` | - | Reads |
 
 Status flow: `Created -> Funded -> Completed`, with `Disputed -> Resolved` and `Cancelled` side exits. A freelancer resignation is a `Cancelled` exit from `Created` or `Funded` that refunds all unreleased funds to the client and is flagged via `Resigned(id)`. Resolved jobs allow reputation rating; dispute outcomes and cancellation metrics are tracked in persistent `Outcomes`.
 
@@ -56,6 +57,12 @@ Errors are returned as typed contract errors. Resignation reuses the existing st
 | `Unauthorized` | Caller is not the escrow freelancer (or otherwise not allowed) |
 | `InvalidStatus` | Escrow is not in `Created` or `Funded` (e.g. already `Disputed`, `Resolved`, `Completed`, or `Cancelled`) |
 | `Paused` | Mutations are disabled by the admin circuit breaker |
+
+### Reputation Governance & Audit Trail
+- Ratings are recorded per escrow as `RatingRecord { freelancer, rating, issued_at, voided }`.
+- Protocol admin can void fraudulent or collusive ratings via `void_rating(id, reason)`, which subtracts the rating and 1 contract from the freelancer's reputation and emits `("rep_void", id) -> (freelancer, rating, reason)`.
+- Voided escrows remain flagged so they cannot be re-rated (`ReputationAlreadyIssued`). Attempting to void twice returns `EscrowError::RatingAlreadyVoided (19)`.
+- Ratings issued before this audit trail upgrade have no `RatingRecord` and return `EscrowError::RatingNotFound (18)`.
 
 ## Build and test
 
