@@ -5963,3 +5963,108 @@ fn admin_transfer_events_have_topic_and_payload() {
     let cncl_data: Address = FromVal::from_val(&env, &cncl.2);
     assert_eq!(cncl_data, old_admin);
 }
+
+// ---------------------------------------------------------------------------
+// Overflow-safe dispute split and checked arithmetic
+// ---------------------------------------------------------------------------
+
+/// Exact 256-bit reference for floor(held * bps / 10_000).
+fn mul_bps_reference(env: &Env, held: i128, bps: u32) -> i128 {
+    soroban_sdk::I256::from_i128(env, held)
+        .mul(&soroban_sdk::I256::from_i128(env, bps as i128))
+        .div(&soroban_sdk::I256::from_i128(env, BPS_DENOMINATOR))
+        .to_i128()
+        .unwrap()
+}
+
+#[test]
+fn mul_bps_matches_256_bit_reference() {
+    let env = Env::default();
+    let helds: [i128; 14] = [
+        0,
+        1,
+        9_999,
+        10_000,
+        10_001,
+        123_456_789,
+        MIN_MILESTONE_AMOUNT,
+        MAX_ESCROW_TOTAL,
+        i128::MAX / 10_000,
+        i128::MAX / 10_000 + 1,
+        i128::MAX / 2,
+        i128::MAX - 1,
+        i128::MAX,
+        170_141_183_460_469_231_731_687_303_715_884_105_000,
+    ];
+    let bpss: [u32; 9] = [0, 1, 2, 2_500, 4_999, 5_000, 7_777, 9_999, 10_000];
+    let mut checked = 0;
+    for held in helds.iter() {
+        for bps in bpss.iter() {
+            assert_eq!(
+                mul_bps(*held, *bps),
+                mul_bps_reference(&env, *held, *bps),
+                "held={} bps={}",
+                held,
+                bps
+            );
+            checked += 1;
+        }
+    }
+    assert!(checked >= 100);
+}
+
+#[test]
+fn max_value_escrow_dispute_split_is_exact() {
+    let s = setup();
+    StellarAssetClient::new(&s.env, &s.token.address).mint(&s.client, &MAX_ESCROW_TOTAL);
+    let id = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, MAX_ESCROW_TOTAL],
+    );
+    s.escrow.deposit_funds(&id, &MAX_ESCROW_TOTAL);
+    let m1 = Address::generate(&s.env);
+    let m2 = Address::generate(&s.env);
+    // Totals above the panel threshold settle through the arbiter panel.
+    s.escrow.set_panel(&vec![&s.env, m1.clone(), m2.clone()], &2);
+    open_dispute_bonded(&s, &id, &s.client);
+    let client_before = s.token.balance(&s.client);
+    s.escrow.vote_resolution(&m1, &id, &2_500);
+    s.escrow.vote_resolution(&m2, &id, &2_500);
+    let to_freelancer = MAX_ESCROW_TOTAL / 4;
+    assert_eq!(s.token.balance(&s.freelancer), to_freelancer);
+    // Client gets the 75% share plus its own bond back (the split favours it).
+    assert_eq!(
+        s.token.balance(&s.client),
+        client_before + (MAX_ESCROW_TOTAL - to_freelancer) + dispute_bond(MAX_ESCROW_TOTAL)
+    );
+    assert_eq!(s.token.balance(&s.escrow.address), 0);
+}
+
+#[test]
+fn issue_reputation_overflow_returns_typed_error() {
+    let s = setup();
+    let id = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 100 * U],
+    );
+    s.escrow.deposit_funds(&id, &(100 * U));
+    s.escrow.release_milestone(&id, &0);
+    s.env.as_contract(&s.escrow.address, || {
+        s.env.storage().persistent().set(
+            &DataKey::Reputation(s.freelancer.clone()),
+            &Reputation {
+                completed_contracts: 1,
+                total_rating: u32::MAX - 1,
+            },
+        );
+    });
+    assert_eq!(
+        s.escrow.try_issue_reputation(&id, &5),
+        Err(Ok(EscrowError::ArithmeticOverflow))
+    );
+    assert!(!s.escrow.get_contract(&id).reputation_issued);
+}

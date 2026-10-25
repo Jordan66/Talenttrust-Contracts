@@ -695,15 +695,21 @@ fn distribute(
     }
     let mut floor_total: i128 = 0;
     for (_, bps) in payees.iter() {
-        floor_total += amount * bps as i128 / BPS_DENOMINATOR;
+        floor_total = floor_total
+            .checked_add(mul_bps(amount, bps))
+            .ok_or(EscrowError::ArithmeticOverflow)?;
     }
-    let remainder = amount - floor_total;
+    let remainder = amount
+        .checked_sub(floor_total)
+        .ok_or(EscrowError::ArithmeticOverflow)?;
     let this = env.current_contract_address();
     let mut is_lead = true;
     for (payee, bps) in payees.iter() {
-        let mut share = amount * bps as i128 / BPS_DENOMINATOR;
+        let mut share = mul_bps(amount, bps);
         if is_lead {
-            share += remainder;
+            share = share
+                .checked_add(remainder)
+                .ok_or(EscrowError::ArithmeticOverflow)?;
             is_lead = false;
         }
         transfer_checked(env, token_addr, &this, &payee, share)?;
@@ -772,7 +778,8 @@ fn build_escrow(
         });
     }
     let id: u64 = env.storage().instance().get(&DataKey::NextId).unwrap_or(1);
-    env.storage().instance().set(&DataKey::NextId, &(id + 1));
+    let next = id.checked_add(1).ok_or(EscrowError::ArithmeticOverflow)?;
+    env.storage().instance().set(&DataKey::NextId, &next);
     bump_instance(&env);
     let fund_by = env
         .ledger()
@@ -944,7 +951,21 @@ pub fn reputation_score(sum: i128, total: i128) -> Option<u32> {
 
 /// Dispute bond for an escrow: `max(DISPUTE_BOND_MIN, total * DISPUTE_BOND_BPS / 10_000)`.
 pub fn dispute_bond(total_amount: i128) -> i128 {
-    DISPUTE_BOND_MIN.max(total_amount.saturating_mul(DISPUTE_BOND_BPS) / BPS_DENOMINATOR)
+    DISPUTE_BOND_MIN.max(mul_bps(total_amount, DISPUTE_BOND_BPS as u32))
+}
+
+/// Overflow-free `floor(amount * bps / D)` for `amount >= 0`, `0 <= bps <= D`
+/// (`D = BPS_DENOMINATOR = 10_000`).
+///
+/// Write `amount = q * D + r` with `q = amount / D` and `0 <= r < D`. Then
+/// `amount * bps / D = q * bps + r * bps / D`, and since `q * bps` is an
+/// integer, `floor(amount * bps / D) = q * bps + floor(r * bps / D)`.
+/// Neither term overflows: `q * bps <= q * D <= amount`, and
+/// `r * bps < D * D = 10^8`.
+pub fn mul_bps(amount: i128, bps: u32) -> i128 {
+    let d = BPS_DENOMINATOR;
+    let bps = bps as i128;
+    (amount / d) * bps + ((amount % d) * bps) / d
 }
 
 /// Splits the held balance of a disputed escrow: `freelancer_bps` (0..=10000)
@@ -962,12 +983,20 @@ fn settle(
     freelancer_bps: u32,
     bond_to_opener: Option<bool>,
 ) -> Result<(), EscrowError> {
-    let held = c.funded_amount - c.released_amount;
-    let to_freelancer = held * freelancer_bps as i128 / BPS_DENOMINATOR;
-    let to_client = held - to_freelancer;
+    let held = c
+        .funded_amount
+        .checked_sub(c.released_amount)
+        .ok_or(EscrowError::ArithmeticOverflow)?;
+    let to_freelancer = mul_bps(held, freelancer_bps);
+    let to_client = held
+        .checked_sub(to_freelancer)
+        .ok_or(EscrowError::ArithmeticOverflow)?;
     pay_out(env, &c, to_freelancer)?;
     refund_funders(env, &c, to_client)?;
-    c.released_amount += to_freelancer;
+    c.released_amount = c
+        .released_amount
+        .checked_add(to_freelancer)
+        .ok_or(EscrowError::ArithmeticOverflow)?;
     c.refunded_amount = to_client;
     c.funded_amount = c.released_amount;
     transition(&mut c, ContractStatus::Resolved)?;
@@ -1940,10 +1969,15 @@ impl Escrow {
         assert_solvent(&env, &c.token);
         save(&env, &c);
         let to = payee(&env, &c);
-        let mut running = c.released_amount - total;
+        let mut running = c
+            .released_amount
+            .checked_sub(total)
+            .ok_or(EscrowError::ArithmeticOverflow)?;
         for (pos, index) in indices.iter().enumerate() {
             let amount = paid_now.get(pos as u32).unwrap();
-            running += amount;
+            running = running
+                .checked_add(amount)
+                .ok_or(EscrowError::ArithmeticOverflow)?;
             events::release(&env, &c, index, amount, &to, running);
         }
         env.events()
@@ -2544,8 +2578,14 @@ impl Escrow {
         }
         let key = DataKey::Reputation(c.freelancer.clone());
         let mut rep: Reputation = env.storage().persistent().get(&key).unwrap_or_default();
-        rep.completed_contracts += 1;
-        rep.total_rating += rating;
+        rep.completed_contracts = rep
+            .completed_contracts
+            .checked_add(1)
+            .ok_or(EscrowError::ArithmeticOverflow)?;
+        rep.total_rating = rep
+            .total_rating
+            .checked_add(rating)
+            .ok_or(EscrowError::ArithmeticOverflow)?;
         env.storage().persistent().set(&key, &rep);
         env.storage()
             .persistent()

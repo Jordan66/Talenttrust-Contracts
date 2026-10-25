@@ -104,6 +104,10 @@ Resolved jobs allow reputation rating; dispute outcomes and cancellation metrics
 
 Bonuses are allowed while an escrow is `Funded` or `Completed`; they do not change the escrow status or accounting.
 
+### Arithmetic
+
+All amount, id and counter arithmetic is checked and fails with `ArithmeticOverflow` (`17`) instead of panicking. Basis-point splits use the overflow-free `mul_bps(amount, bps) = (amount / D) * bps + ((amount % D) * bps) / D` (`D = 10_000`), which equals `floor(amount * bps / D)` for any `amount`.
+
 ### Token transfers
 
 Every transfer into or out of the contract (deposits, releases, refunds, dispute splits and bonds, sweeps) is balance-delta checked: the contract's balance must change by exactly the requested amount, otherwise the call fails with `TransferAmountMismatch` and fully reverts. Fee-on-transfer, rebasing and no-op tokens are therefore rejected rather than silently under-collateralising other escrows of the same token.
