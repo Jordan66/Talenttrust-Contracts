@@ -6068,3 +6068,164 @@ fn issue_reputation_overflow_returns_typed_error() {
     );
     assert!(!s.escrow.get_contract(&id).reputation_issued);
 }
+
+// ---------------------------------------------------------------------------
+// Emergency withdraw after a prolonged pause
+// ---------------------------------------------------------------------------
+
+fn set_ts(env: &Env, ts: u64) {
+    env.ledger().with_mut(|li| li.timestamp = ts);
+}
+
+#[test]
+fn emergency_withdraw_boundary_and_funded_refund() {
+    let s = setup();
+    let id = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 100 * U],
+    );
+    s.escrow.deposit_funds(&id, &(100 * U));
+    set_ts(&s.env, 10_000);
+    s.escrow.set_paused(&s.admin, &true);
+    assert_eq!(s.escrow.get_paused_at(), Some(10_000));
+
+    set_ts(&s.env, 10_000 + EMERGENCY_EXIT_DELAY_SECS - 1);
+    assert_eq!(
+        s.escrow.try_emergency_withdraw(&id, &s.client),
+        Err(Ok(EscrowError::EmergencyExitNotAvailable))
+    );
+
+    set_ts(&s.env, 10_000 + EMERGENCY_EXIT_DELAY_SECS);
+    s.escrow.emergency_withdraw(&id, &s.client);
+    assert_eq!(s.token.balance(&s.client), 1_000 * U);
+    assert_eq!(s.token.balance(&s.freelancer), 0);
+    let c = s.escrow.get_contract(&id);
+    assert_eq!(c.status, ContractStatus::Cancelled);
+    assert_eq!(c.funded_amount, c.released_amount);
+    assert_eq!(s.token.balance(&s.escrow.address), 0);
+    assert_eq!(s.escrow.get_liability(&s.token.address), 0);
+    assert_eq!(
+        s.escrow.try_emergency_withdraw(&id, &s.client),
+        Err(Ok(EscrowError::InvalidStatus))
+    );
+}
+
+#[test]
+fn emergency_withdraw_disputed_split_rounding() {
+    let s = setup();
+    // Odd amount: 1_000_001 splits 500_000 to the freelancer, 500_001 to the client.
+    let id = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 1_000_001i128],
+    );
+    s.escrow.deposit_funds(&id, &1_000_001);
+    open_dispute_bonded(&s, &id, &s.client);
+    let bond = dispute_bond(1_000_001);
+    let client_before = s.token.balance(&s.client);
+    set_ts(&s.env, 1);
+    s.escrow.set_paused(&s.admin, &true);
+    set_ts(&s.env, 1 + EMERGENCY_EXIT_DELAY_SECS);
+
+    s.escrow.emergency_withdraw(&id, &s.freelancer);
+    assert_eq!(s.token.balance(&s.freelancer), 500_000);
+    // Client gets the larger half plus its dispute bond back.
+    assert_eq!(s.token.balance(&s.client), client_before + 500_001 + bond);
+    assert_eq!(s.token.balance(&s.escrow.address), 0);
+    assert_eq!(s.escrow.get_dispute_bond(&id), None);
+    assert_eq!(s.escrow.get_contract(&id).status, ContractStatus::Cancelled);
+}
+
+#[test]
+fn emergency_withdraw_repause_resets_clock() {
+    let s = setup();
+    let id = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 100 * U],
+    );
+    s.escrow.deposit_funds(&id, &(100 * U));
+    set_ts(&s.env, 100);
+    s.escrow.set_paused(&s.admin, &true);
+    s.escrow.set_paused(&s.admin, &false);
+    assert_eq!(s.escrow.get_paused_at(), None);
+    let second_pause = 100 + EMERGENCY_EXIT_DELAY_SECS;
+    set_ts(&s.env, second_pause);
+    s.escrow.set_paused(&s.admin, &true);
+    // Re-asserting the pause does not move the clock.
+    s.escrow.set_paused(&s.admin, &true);
+    assert_eq!(s.escrow.get_paused_at(), Some(second_pause));
+    set_ts(&s.env, second_pause + EMERGENCY_EXIT_DELAY_SECS - 1);
+    assert_eq!(
+        s.escrow.try_emergency_withdraw(&id, &s.client),
+        Err(Ok(EscrowError::EmergencyExitNotAvailable))
+    );
+    set_ts(&s.env, second_pause + EMERGENCY_EXIT_DELAY_SECS);
+    s.escrow.emergency_withdraw(&id, &s.client);
+    assert_eq!(s.token.balance(&s.client), 1_000 * U);
+}
+
+#[test]
+fn emergency_withdraw_stranger_and_unpaused_rejected() {
+    let s = setup();
+    let id = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 100 * U],
+    );
+    s.escrow.deposit_funds(&id, &(100 * U));
+    // Unpaused: even long after, exit is not available.
+    set_ts(&s.env, EMERGENCY_EXIT_DELAY_SECS * 2);
+    assert_eq!(
+        s.escrow.try_emergency_withdraw(&id, &s.client),
+        Err(Ok(EscrowError::EmergencyExitNotAvailable))
+    );
+    s.escrow.set_paused(&s.admin, &true);
+    set_ts(&s.env, EMERGENCY_EXIT_DELAY_SECS * 3);
+    let stranger = Address::generate(&s.env);
+    assert_eq!(
+        s.escrow.try_emergency_withdraw(&id, &stranger),
+        Err(Ok(EscrowError::Unauthorized))
+    );
+    assert_eq!(s.escrow.get_contract(&id).status, ContractStatus::Funded);
+}
+
+#[test]
+fn emergency_withdraw_pays_submitted_work_and_keeps_balances_consistent() {
+    let s = setup();
+    let a = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 100 * U, 200 * U],
+    );
+    s.escrow.deposit_funds(&a, &(300 * U));
+    s.escrow.submit_milestone(&a, &0);
+    let b = s.escrow.create_contract(
+        &s.client,
+        &s.freelancer,
+        &s.token.address,
+        &vec![&s.env, 50 * U],
+    );
+    s.escrow.deposit_funds(&b, &(50 * U));
+    s.escrow.set_paused(&s.admin, &true);
+    set_ts(&s.env, EMERGENCY_EXIT_DELAY_SECS);
+
+    s.escrow.emergency_withdraw(&a, &s.freelancer);
+    assert_eq!(s.token.balance(&s.freelancer), 100 * U);
+    // Remaining escrow b is still fully backed.
+    let cb = s.escrow.get_contract(&b);
+    assert_eq!(
+        s.token.balance(&s.escrow.address),
+        cb.funded_amount - cb.released_amount
+    );
+    assert_eq!(s.escrow.get_liability(&s.token.address), 50 * U);
+    s.escrow.emergency_withdraw(&b, &s.client);
+    assert_eq!(s.token.balance(&s.escrow.address), 0);
+    assert_eq!(s.token.balance(&s.client), 1_000 * U - 100 * U);
+}

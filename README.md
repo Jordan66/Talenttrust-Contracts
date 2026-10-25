@@ -63,6 +63,8 @@ Machine-readable details are in [deployments/testnet.json](deployments/testnet.j
 | `get_pending_upgrade()`, `version()` | - | Pending upgrade (if any) and on-chain code version (`1` until the first upgrade) |
 | `propose_admin(new_admin)` / `accept_admin()` / `cancel_admin_proposal()` | admin / nominee / admin | Two-step admin rotation (works while paused): propose (`InvalidAdmin` (`45`) for the current admin; overwrites a pending nomination), the nominee accepts, or the admin cancels (`NoPendingAdmin` (`46`) if none). Events: `("adm_prop",) -> (current, new)`, `("adm_acc",) -> (old, new)`, `("adm_cncl",) -> cancelled` |
 | `get_pending_admin()` | - | Pending admin nominee, if any |
+| `emergency_withdraw(id, caller)` | client or freelancer | After a continuous pause of `EMERGENCY_EXIT_DELAY_SECS` (30 days) unwind a `Created`/`Funded`/`Disputed` escrow: unreleased funds return to the client/funders (submitted milestones go to the freelancer); `Disputed` splits 50/50 with the remainder to the client and returns the dispute bond; ends `Cancelled`. `EmergencyExitNotAvailable` (`47`) before the delay or while unpaused. Emits `("emerg", id) -> (to_client, to_freelancer)`. Re-pausing restarts the clock (the admin can delay, but not block, an exit only by keeping the contract unpaused) |
+| `get_paused_at()` | - | Timestamp at which the current pause began |
 | `set_paused(caller, paused)` / `is_paused()` | admin or Pauser / - | Circuit breaker for all mutations |
 | `grant_role(role, account)` / `revoke_role(role, account)` | admin | Grant or revoke a `Pauser` or `Resolver` role (`RoleUnchanged` (`33`) if no change); emits `("role_set", role) -> (account, true\|false)` |
 | `has_role(role, account)` | - | Role membership; the admin implicitly holds every role |
@@ -198,6 +200,7 @@ Bonus payments reuse the escrow's existing validation errors: a missing escrow `
 | 44 | `TransferAmountMismatch` | any token transfer into/out of the contract that does not move the contract balance by exactly the requested amount (fee-on-transfer, rebasing or no-op tokens are rejected) |
 | 45 | `InvalidAdmin` | `propose_admin` with the current admin |
 | 46 | `NoPendingAdmin` | `accept_admin` / `cancel_admin_proposal` without a nomination |
+| 47 | `EmergencyExitNotAvailable` | `emergency_withdraw` while unpaused or before the pause delay elapsed |
 
 Constants: `MIN_MILESTONE_AMOUNT = 1_000_000` (0.1 token at 7 decimals), `MIN_REPUTATION_VALUE = 10_000_000` (1 token at 7 decimals; ratings are weighted by the released amount and dust jobs cannot be rated — sybil resistance comes from this value threshold, not counterparty graph analysis, so clients who are also freelancers of the same counterparty are not blocked), `MAX_ESCROW_TOTAL = 10^18` stroops, `MAX_MILESTONES = 20`.
 

@@ -32,6 +32,8 @@ pub const MAX_MIGRATE_BATCH: u32 = 50;
 pub const BPS_DENOMINATOR: i128 = 10_000;
 /// 48-hour time-lock delay before a scheduled WASM upgrade can be executed.
 pub const UPGRADE_DELAY_SECS: u64 = 172_800;
+/// Minimum continuous pause before either party can force an emergency exit (30 days).
+pub const EMERGENCY_EXIT_DELAY_SECS: u64 = 30 * 86_400;
 /// Minimum review window after a milestone submission: 1 hour.
 pub const MIN_REVIEW_WINDOW_SECS: u64 = 3_600;
 /// Maximum review window after a milestone submission: 30 days.
@@ -126,6 +128,7 @@ pub enum EscrowError {
     TransferAmountMismatch = 44,
     InvalidAdmin = 45,
     NoPendingAdmin = 46,
+    EmergencyExitNotAvailable = 47,
 }
 
 #[contracttype]
@@ -412,6 +415,8 @@ enum DataKey {
     Submitted(u64, u32),
     ReviewWindow(u64),
     PendingAdmin,
+    /// Ledger timestamp at which the current continuous pause began.
+    PausedAt,
 }
 
 #[contract]
@@ -1350,9 +1355,118 @@ impl Escrow {
         if !holds_role(&env, Role::Pauser, &caller) {
             return Err(EscrowError::Unauthorized);
         }
+        let was_paused: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false);
         env.storage().instance().set(&DataKey::Paused, &paused);
+        // The emergency-exit clock starts on unpaused -> paused and resets on unpause.
+        if paused && !was_paused {
+            env.storage()
+                .instance()
+                .set(&DataKey::PausedAt, &env.ledger().timestamp());
+        } else if !paused {
+            env.storage().instance().remove(&DataKey::PausedAt);
+        }
         bump_instance(&env);
         events::paused(&env, paused);
+        Ok(())
+    }
+
+    /// Ledger timestamp at which the current pause began, if paused.
+    pub fn get_paused_at(env: Env) -> Option<u64> {
+        env.storage().instance().get(&DataKey::PausedAt)
+    }
+
+    /// Emergency exit after a prolonged pause: once the contract has been
+    /// paused continuously for `EMERGENCY_EXIT_DELAY_SECS`, the client or the
+    /// freelancer can unwind a `Created` / `Funded` / `Disputed` escrow at its
+    /// last agreed state. Unreleased funds return to the client (pro-rata to
+    /// funders), except funds backing milestones the freelancer already
+    /// submitted, which go to the freelancer; a `Disputed` escrow is split
+    /// 50/50 with the rounding remainder to the client, and any dispute bond
+    /// returns to its opener. The escrow ends `Cancelled`. Deliberately works
+    /// while paused (and while frozen): it is the guaranteed way out. Note the
+    /// admin can delay it by toggling the pause, which restarts the clock.
+    /// Emits `("emerg", id) -> (to_client, to_freelancer)`.
+    pub fn emergency_withdraw(env: Env, id: u64, caller: Address) -> Result<(), EscrowError> {
+        caller.require_auth();
+        let mut c = load(&env, id)?;
+        if caller != c.client && caller != c.freelancer {
+            return Err(EscrowError::Unauthorized);
+        }
+        let paused_at: Option<u64> = env.storage().instance().get(&DataKey::PausedAt);
+        let available = match paused_at {
+            Some(at) if Self::is_paused(env.clone()) => {
+                let unlock = at
+                    .checked_add(EMERGENCY_EXIT_DELAY_SECS)
+                    .ok_or(EscrowError::ArithmeticOverflow)?;
+                env.ledger().timestamp() >= unlock
+            }
+            _ => false,
+        };
+        if !available {
+            return Err(EscrowError::EmergencyExitNotAvailable);
+        }
+        if !matches!(
+            c.status,
+            ContractStatus::Created | ContractStatus::Funded | ContractStatus::Disputed
+        ) {
+            return Err(EscrowError::InvalidStatus);
+        }
+        let held = c
+            .funded_amount
+            .checked_sub(c.released_amount)
+            .ok_or(EscrowError::ArithmeticOverflow)?;
+        let to_freelancer = if c.status == ContractStatus::Disputed {
+            held / 2
+        } else {
+            let committed = submitted_backing(&env, &c)?.min(held);
+            if committed > 0 {
+                // Submitted milestones are treated as delivered: mark them released.
+                for i in 0..c.milestones.len() {
+                    let mut m = c.milestones.get(i).unwrap();
+                    if !m.released && submitted_at(&env, id, i).is_some() {
+                        m.released = true;
+                        c.milestones.set(i, m);
+                        clear_submitted(&env, id, i);
+                        clear_milestone_paid(&env, id, i);
+                    }
+                }
+            }
+            committed
+        };
+        let to_client = held - to_freelancer;
+        pay_out(&env, &c, to_freelancer)?;
+        refund_funders(&env, &c, to_client)?;
+        c.released_amount = c
+            .released_amount
+            .checked_add(to_freelancer)
+            .ok_or(EscrowError::ArithmeticOverflow)?;
+        c.refunded_amount = to_client;
+        c.funded_amount = c.released_amount;
+        // Dedicated emergency edge (outside the normal lifecycle machine):
+        // Created / Funded / Disputed -> Cancelled.
+        c.status = ContractStatus::Cancelled;
+        record_closed_at(&env, id);
+        sub_liability(&env, &c.token, held)?;
+        // Return any dispute bond to whoever posted it.
+        let bond_key = DataKey::DisputeBond(id);
+        if let Some((opener, bond)) = env
+            .storage()
+            .persistent()
+            .get::<_, (Address, i128)>(&bond_key)
+        {
+            env.storage().persistent().remove(&bond_key);
+            transfer_checked(&env, &c.token, &env.current_contract_address(), &opener, bond)?;
+            sub_liability(&env, &c.token, bond)?;
+        }
+        #[cfg(any(test, debug_assertions))]
+        assert_solvent(&env, &c.token);
+        save(&env, &c);
+        env.events()
+            .publish((symbol_short!("emerg"), id), (to_client, to_freelancer));
         Ok(())
     }
 
